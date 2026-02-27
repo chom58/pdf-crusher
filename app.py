@@ -9,9 +9,13 @@ import tempfile
 import streamlit as st
 
 from pdf_crusher import (
+    MODE_GHOSTSCRIPT,
+    MODE_RASTERIZE,
+    check_ghostscript,
     check_pdftoppm,
     format_size,
     get_page_count,
+    ghostscript_iterative_compress,
     iterative_compress,
 )
 
@@ -49,11 +53,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# pdftoppm チェック
+# ツールの存在チェック
+_pdftoppm_ok = True
+_gs_ok = True
 try:
     check_pdftoppm()
 except SystemExit:
-    st.error("サーバーに poppler (pdftoppm) がインストールされていません。")
+    _pdftoppm_ok = False
+try:
+    check_ghostscript()
+except SystemExit:
+    _gs_ok = False
+
+if not _pdftoppm_ok and not _gs_ok:
+    st.error("サーバーに poppler (pdftoppm) も Ghostscript (gs) もインストールされていません。")
     st.stop()
 
 # セッション状態の初期化
@@ -64,6 +77,26 @@ if "result" not in st.session_state:
 with st.sidebar:
     st.header("設定")
 
+    # モード選択
+    mode_options = {}
+    if _pdftoppm_ok:
+        mode_options["ラスタライズ（サイズ保証）"] = MODE_RASTERIZE
+    if _gs_ok:
+        mode_options["Ghostscript（テキスト保持）"] = MODE_GHOSTSCRIPT
+
+    if len(mode_options) == 1:
+        compress_mode = list(mode_options.values())[0]
+        st.info(f"モード: {list(mode_options.keys())[0]}")
+    else:
+        mode_label = st.radio(
+            "圧縮モード",
+            options=list(mode_options.keys()),
+            help="ラスタライズ: サイズ確実だがテキスト選択不可。Ghostscript: テキスト保持だがサイズはベストエフォート。",
+        )
+        compress_mode = mode_options[mode_label]
+
+    st.divider()
+
     target_mb = st.select_slider(
         "目標サイズ",
         options=[0.5, 1, 2, 3, 5, 10, 15, 20],
@@ -72,19 +105,29 @@ with st.sidebar:
     )
     target_size = int(target_mb * 1024 * 1024)
 
-    min_dpi = st.select_slider(
-        "最低DPI（品質下限）",
-        options=[72, 85, 100, 120, 150],
-        value=72,
-        help="DPIが低いほど圧縮率が高いが、画質が落ちる",
-    )
+    if compress_mode == MODE_RASTERIZE:
+        min_dpi = st.select_slider(
+            "最低DPI（品質下限）",
+            options=[72, 85, 100, 120, 150],
+            value=72,
+            help="DPIが低いほど圧縮率が高いが、画質が落ちる",
+        )
+    else:
+        min_dpi = 72  # Ghostscriptモードでは不使用
 
     st.divider()
-    st.markdown(
-        "**仕組み:** PDF → 画像化 → JPEG圧縮 → PDF再構成。"
-        "DPIとJPEG品質を自動調整し、確実に目標以下に。"
-    )
-    st.caption("テキスト選択はできなくなります（画像化のため）")
+    if compress_mode == MODE_RASTERIZE:
+        st.markdown(
+            "**仕組み:** PDF → 画像化 → JPEG圧縮 → PDF再構成。"
+            "DPIとJPEG品質を自動調整し、確実に目標以下に。"
+        )
+        st.caption("テキスト選択はできなくなります（画像化のため）")
+    else:
+        st.markdown(
+            "**仕組み:** GhostscriptでPDF内部の画像を再圧縮。"
+            "テキスト・ベクター要素はそのまま保持。"
+        )
+        st.caption("テキスト選択・コピーが可能です")
 
 # ファイルアップロード
 uploaded_file = st.file_uploader(
@@ -104,7 +147,7 @@ elif st.session_state.get("last_file_name") is not None:
     st.session_state.last_file_name = None
 
 
-def run_compression(file_data: bytes, file_name: str, target_size: int, min_dpi: int):
+def run_compression(file_data: bytes, file_name: str, target_size: int, min_dpi: int, mode: str):
     """圧縮を実行し、結果をsession_stateに格納"""
     status_text = st.empty()
     progress_bar = st.progress(0)
@@ -114,9 +157,12 @@ def run_compression(file_data: bytes, file_name: str, target_size: int, min_dpi:
     def on_status(msg):
         status_text.markdown(f"**{msg}**")
 
-    def on_search_step(quality, estimated, is_ok):
+    def on_search_step(quality_or_preset, estimated_or_size, is_ok):
         mark = "✓" if is_ok else "✗"
-        entry = f"品質={quality}: {format_size(estimated)} {mark}"
+        if mode == MODE_GHOSTSCRIPT:
+            entry = f"{quality_or_preset}: {format_size(estimated_or_size)} {mark}"
+        else:
+            entry = f"品質={quality_or_preset}: {format_size(estimated_or_size)} {mark}"
         search_entries.append(entry)
         search_log.code("\n".join(search_entries[-8:]))
 
@@ -134,28 +180,47 @@ def run_compression(file_data: bytes, file_name: str, target_size: int, min_dpi:
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_out:
             tmp_output_path = tmp_out.name
 
-        actual_size, used_dpi, used_quality = iterative_compress(
-            pdf_path=tmp_input_path,
-            output_path=tmp_output_path,
-            target_size=target_size,
-            min_dpi=min_dpi,
-            on_status=on_status,
-            on_search_step=on_search_step,
-            on_progress=on_progress,
-        )
+        if mode == MODE_GHOSTSCRIPT:
+            actual_size, used_preset, used_dpi = ghostscript_iterative_compress(
+                pdf_path=tmp_input_path,
+                output_path=tmp_output_path,
+                target_size=target_size,
+                on_status=on_status,
+                on_search_step=on_search_step,
+                on_progress=on_progress,
+            )
+            st.session_state.result = {
+                "compressed_data": None,
+                "input_size": len(file_data),
+                "actual_size": actual_size,
+                "used_preset": used_preset,
+                "used_dpi": used_dpi,
+                "file_name": file_name,
+                "mode": MODE_GHOSTSCRIPT,
+            }
+        else:
+            actual_size, used_dpi, used_quality = iterative_compress(
+                pdf_path=tmp_input_path,
+                output_path=tmp_output_path,
+                target_size=target_size,
+                min_dpi=min_dpi,
+                on_status=on_status,
+                on_search_step=on_search_step,
+                on_progress=on_progress,
+            )
+            st.session_state.result = {
+                "compressed_data": None,
+                "input_size": len(file_data),
+                "actual_size": actual_size,
+                "used_dpi": used_dpi,
+                "used_quality": used_quality,
+                "file_name": file_name,
+                "mode": MODE_RASTERIZE,
+            }
 
         # 結果データを読み込んでセッションに保存
         with open(tmp_output_path, "rb") as f:
-            compressed_data = f.read()
-
-        st.session_state.result = {
-            "compressed_data": compressed_data,
-            "input_size": len(file_data),
-            "actual_size": actual_size,
-            "used_dpi": used_dpi,
-            "used_quality": used_quality,
-            "file_name": file_name,
-        }
+            st.session_state.result["compressed_data"] = f.read()
 
     except RuntimeError as e:
         st.error(f"圧縮エラー: {e}")
@@ -210,11 +275,19 @@ if uploaded_file is not None:
         title = "圧縮完了" if achieved else "圧縮完了（目標未達）"
         extra = "" if achieved else f'<p>目標 {format_size(target_size)} に対し超過</p>'
 
+        if r.get("mode") == MODE_GHOSTSCRIPT:
+            setting_str = f'プリセット={r["used_preset"]} | DPI={r["used_dpi"]}'
+            mode_str = "Ghostscript（テキスト保持）"
+        else:
+            setting_str = f'DPI={r["used_dpi"]} | 品質={r["used_quality"]}'
+            mode_str = "ラスタライズ（サイズ保証）"
+
         st.markdown(
             f'<div class="{css_class}">'
             f"<p>{title}</p>"
             f'<p class="stat-number">{format_size(r["input_size"])} → {format_size(r["actual_size"])}</p>'
-            f'<p>{reduction:.1f}% 削減 | DPI={r["used_dpi"]} | 品質={r["used_quality"]}</p>'
+            f"<p>{reduction:.1f}% 削減 | {setting_str}</p>"
+            f"<p><small>{mode_str}</small></p>"
             f"{extra}</div>",
             unsafe_allow_html=True,
         )
@@ -234,7 +307,8 @@ if uploaded_file is not None:
             st.rerun()
     else:
         # 圧縮ボタン
-        st.info(f"目標: {format_size(target_size)} 以下に圧縮します（現在 {format_size(input_size)}）")
+        mode_hint = "テキスト保持" if compress_mode == MODE_GHOSTSCRIPT else "サイズ保証"
+        st.info(f"目標: {format_size(target_size)} 以下に圧縮します（現在 {format_size(input_size)}）【{mode_hint}モード】")
         if st.button("圧縮開始", type="primary", use_container_width=True):
-            run_compression(file_data, uploaded_file.name, target_size, min_dpi)
+            run_compression(file_data, uploaded_file.name, target_size, min_dpi, compress_mode)
             st.rerun()

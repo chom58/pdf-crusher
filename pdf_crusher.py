@@ -24,8 +24,20 @@ except ImportError:
     sys.exit(1)
 
 
+# 圧縮モード
+MODE_RASTERIZE = "rasterize"
+MODE_GHOSTSCRIPT = "ghostscript"
+
 # DPIレベル: 高い方から試行し、目標未達なら下げていく
 DPI_LEVELS = [200, 150, 120, 100, 85, 72]
+
+# Ghostscript の品質プリセット（高品質→低品質の順）
+GS_QUALITY_PRESETS = [
+    ("prepress", "/prepress"),    # 300dpi相当、高品質
+    ("printer", "/printer"),      # 300dpi相当、印刷品質
+    ("ebook", "/ebook"),          # 150dpi相当、電子書籍品質
+    ("screen", "/screen"),        # 72dpi相当、画面表示品質
+]
 
 # JPEG品質の探索範囲
 QUALITY_MIN = 5
@@ -70,6 +82,172 @@ def check_pdftoppm():
         print("  macOS: brew install poppler")
         print("  Ubuntu: sudo apt install poppler-utils")
         sys.exit(1)
+
+
+def check_ghostscript():
+    """Ghostscriptの存在確認"""
+    if shutil.which("gs") is None:
+        print("エラー: Ghostscript (gs) が見つかりません。")
+        print("  macOS: brew install ghostscript")
+        print("  Ubuntu: sudo apt install ghostscript")
+        sys.exit(1)
+
+
+def gs_compress(pdf_path: str, output_path: str, preset: str, verbose: bool = False) -> int:
+    """Ghostscriptで指定プリセットでPDFを圧縮。出力ファイルサイズを返す。"""
+    cmd = [
+        "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS={preset}",
+        "-dNOPAUSE", "-dBATCH", "-dQUIET",
+        "-dColorImageResolution=150",
+        "-dGrayImageResolution=150",
+        "-dMonoImageResolution=300",
+        f"-sOutputFile={output_path}",
+        pdf_path,
+    ]
+    if verbose:
+        print(f"  Ghostscript 実行中 (プリセット={preset})...")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise RuntimeError(f"Ghostscript エラー: {stderr}")
+
+    return os.path.getsize(output_path)
+
+
+def gs_compress_with_downsampling(
+    pdf_path: str, output_path: str, preset: str,
+    color_dpi: int, gray_dpi: int, mono_dpi: int,
+    verbose: bool = False,
+) -> int:
+    """Ghostscriptでカスタム解像度指定でPDFを圧縮。"""
+    cmd = [
+        "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS={preset}",
+        "-dNOPAUSE", "-dBATCH", "-dQUIET",
+        "-dDownsampleColorImages=true",
+        "-dDownsampleGrayImages=true",
+        "-dDownsampleMonoImages=true",
+        f"-dColorImageResolution={color_dpi}",
+        f"-dGrayImageResolution={gray_dpi}",
+        f"-dMonoImageResolution={mono_dpi}",
+        f"-sOutputFile={output_path}",
+        pdf_path,
+    ]
+    if verbose:
+        print(f"  Ghostscript 実行中 (プリセット={preset}, カラーDPI={color_dpi})...")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise RuntimeError(f"Ghostscript エラー: {stderr}")
+
+    return os.path.getsize(output_path)
+
+
+def ghostscript_iterative_compress(
+    pdf_path: str,
+    output_path: str,
+    target_size: int,
+    verbose: bool = False,
+    on_status: callable = None,
+    on_search_step: callable = None,
+    on_progress: callable = None,
+) -> tuple[int, str, int]:
+    """
+    Ghostscriptによる反復圧縮。テキスト選択を保持したまま圧縮。
+    プリセットを段階的に下げ、さらにDPIも調整して目標サイズを目指す。
+
+    Returns: (output_size, preset_name, color_dpi)
+    """
+    def _status(msg):
+        print(msg)
+        if on_status:
+            on_status(msg)
+
+    # フェーズ1: プリセットを順に試す
+    dpi_for_preset = {
+        "/prepress": 300,
+        "/printer": 300,
+        "/ebook": 150,
+        "/screen": 72,
+    }
+
+    for preset_name, preset in GS_QUALITY_PRESETS:
+        _status(f"Ghostscript: プリセット={preset_name} で圧縮中...")
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            actual_size = gs_compress(pdf_path, tmp_path, preset, verbose)
+            default_dpi = dpi_for_preset[preset]
+            is_ok = actual_size <= target_size
+            mark = "✓" if is_ok else "✗"
+
+            _status(f"  プリセット={preset_name}: {format_size(actual_size)} {mark}")
+            if on_search_step:
+                on_search_step(preset_name, actual_size, is_ok)
+
+            if is_ok:
+                shutil.copy2(tmp_path, output_path)
+                if on_progress:
+                    on_progress(1, 1)
+                return actual_size, preset_name, default_dpi
+
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    # フェーズ2: screenプリセットでもDPIを下げていく
+    extra_dpis = [50, 36, 24]
+    for dpi in extra_dpis:
+        _status(f"Ghostscript: screen + DPI={dpi} で圧縮中...")
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            actual_size = gs_compress_with_downsampling(
+                pdf_path, tmp_path, "/screen",
+                color_dpi=dpi, gray_dpi=dpi, mono_dpi=dpi * 2,
+                verbose=verbose,
+            )
+            is_ok = actual_size <= target_size
+            mark = "✓" if is_ok else "✗"
+
+            _status(f"  screen+DPI={dpi}: {format_size(actual_size)} {mark}")
+            if on_search_step:
+                on_search_step(f"screen (DPI={dpi})", actual_size, is_ok)
+
+            if is_ok:
+                shutil.copy2(tmp_path, output_path)
+                if on_progress:
+                    on_progress(1, 1)
+                return actual_size, f"screen (DPI={dpi})", dpi
+
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    # 最低設定でも未達: 最後の結果をそのまま使う
+    _status("警告: Ghostscriptで目標未達。最低設定で出力します。")
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        actual_size = gs_compress_with_downsampling(
+            pdf_path, tmp_path, "/screen",
+            color_dpi=24, gray_dpi=24, mono_dpi=48,
+            verbose=verbose,
+        )
+        shutil.copy2(tmp_path, output_path)
+        if on_progress:
+            on_progress(1, 1)
+        return actual_size, "screen (DPI=24)", 24
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def get_page_count(pdf_path: str) -> int:
@@ -313,12 +491,18 @@ def main():
   python pdf_crusher.py input.pdf -s 3MB             # 3MB以下に圧縮
   python pdf_crusher.py input.pdf -o out.pdf -s 1MB  # 出力先と目標サイズ指定
   python pdf_crusher.py input.pdf --min-dpi 100      # 最低DPIを100に制限
+  python pdf_crusher.py input.pdf --mode ghostscript  # テキスト保持モード
         """,
     )
     parser.add_argument("input", help="入力PDFファイルのパス")
     parser.add_argument("-o", "--output", help="出力PDFファイルのパス (デフォルト: <入力名>_compressed.pdf)")
     parser.add_argument("-s", "--size", default="5MB", help="目標ファイルサイズ (デフォルト: 5MB)")
     parser.add_argument("--min-dpi", type=int, default=72, help="最低DPI (デフォルト: 72)")
+    parser.add_argument(
+        "-m", "--mode", choices=[MODE_RASTERIZE, MODE_GHOSTSCRIPT],
+        default=MODE_RASTERIZE,
+        help="圧縮モード: rasterize=画像化(サイズ保証), ghostscript=テキスト保持(ベストエフォート) (デフォルト: rasterize)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="詳細出力")
 
     args = parser.parse_args()
@@ -340,12 +524,18 @@ def main():
     # 目標サイズ解析
     target_size = parse_size(args.size)
 
-    # pdftoppm確認
-    check_pdftoppm()
+    # ツール確認
+    mode = args.mode
+    if mode == MODE_GHOSTSCRIPT:
+        check_ghostscript()
+    else:
+        check_pdftoppm()
 
     # 入力ファイル情報
     input_size = os.path.getsize(input_path)
     page_count = get_page_count(input_path)
+
+    mode_label = "Ghostscript (テキスト保持)" if mode == MODE_GHOSTSCRIPT else "ラスタライズ (サイズ保証)"
 
     # ヘッダー表示
     print()
@@ -353,6 +543,7 @@ def main():
     print("━" * 40)
     print(f"入力: {Path(input_path).name} ({format_size(input_size)}, {page_count}ページ)")
     print(f"目標: {format_size(target_size)} 以下")
+    print(f"モード: {mode_label}")
 
     # 既に目標以下の場合
     if input_size <= target_size:
@@ -363,9 +554,16 @@ def main():
         sys.exit(0)
 
     # 圧縮実行
-    actual_size, used_dpi, used_quality = iterative_compress(
-        input_path, output_path, target_size, args.min_dpi, args.verbose
-    )
+    if mode == MODE_GHOSTSCRIPT:
+        actual_size, used_preset, used_dpi = ghostscript_iterative_compress(
+            input_path, output_path, target_size, args.verbose
+        )
+        setting_str = f"プリセット={used_preset}, DPI={used_dpi}"
+    else:
+        actual_size, used_dpi, used_quality = iterative_compress(
+            input_path, output_path, target_size, args.min_dpi, args.verbose
+        )
+        setting_str = f"DPI={used_dpi}, JPEG品質={used_quality}"
 
     # 結果表示
     reduction = (1 - actual_size / input_size) * 100
@@ -375,7 +573,8 @@ def main():
     print("━" * 40)
     print(f"結果: {Path(output_path).name}")
     print(f"{format_size(input_size)} → {format_size(actual_size)} ({reduction:.1f}% 削減) {achieved}")
-    print(f"設定: DPI={used_dpi}, JPEG品質={used_quality}")
+    print(f"設定: {setting_str}")
+    print(f"モード: {mode_label}")
     print("━" * 40)
 
     if actual_size > target_size:
